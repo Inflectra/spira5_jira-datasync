@@ -55,6 +55,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
         private int? severityCustomFieldId = null;
         private bool useSecurityLevel = false;
         private bool onlyCreateNewItemsInJira = false;
+        private bool bidirectionalIncidentSync = false;
         private string issueLinkType = null;
         private List<int> requirementIssueTypes = new List<int>();
 
@@ -86,7 +87,11 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
         /// <param name="autoMapUsers">Should we auto-map users</param>
         /// <param name="custom01">The name of the JIRA custom property to map to Spira incident severity</param>
         /// <param name="custom02">Set to 'true' to specify that we need to set the JIRA 'security level'</param>
-        /// <param name="custom03">Set to 'true' if we only want new items to flow from Spira > JIRA</param>
+        /// <param name="custom03">
+        /// Set to 'true' if we only want new items to flow from Spira > JIRA
+        /// Set to 'full' if we want to have full synchronization in both directions for issues
+        /// Set to anything else (or empty) for the default partial bi-directional synchronization
+        /// </param>
         /// <param name="custom04">Set to a comma-separated list of JIRA issue types that should be added as requirements to Spira</param>
         /// <param name="custom05">Set to the ID of the JIRA issue link type we want associations to map to</param>
         public void Setup(
@@ -135,6 +140,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                 }
                 this.useSecurityLevel = (custom02 != null && custom02.ToLowerInvariant() == "true");
                 this.onlyCreateNewItemsInJira = (custom03 != null && custom03.ToLowerInvariant() == "true");
+                this.bidirectionalIncidentSync = (custom03 != null && custom03.ToLowerInvariant() == "both");
 
                 //See if we have any issue types specified for mapping to requirements
                 if (!String.IsNullOrWhiteSpace(custom04))
@@ -710,7 +716,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                             {
                                 foreach (SpiraSoapService.RemoteComment incidentComment in incidentComments)
                                 {
-                                    if (incidentComment.Text == jiraComment.Body)
+                                    if (InternalFunctions.HtmlRenderAsPlainText(incidentComment.Text).Trim() == jiraComment.Body.Trim())
                                     {
                                         alreadyAdded = true;
                                     }
@@ -1048,7 +1054,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
             catch (Exception exception)
             {
                 //Log and continue execution
-                LogErrorEvent("Error Inserting/Updating JIRA Issue in " + productName + ": " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Error);
+                LogErrorEvent("Error Inserting/Updating JIRA Issue " + jiraIssue.Key.ToString() + " in " + productName + ": " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Error);
             }
         }
 
@@ -1520,7 +1526,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
             catch (Exception exception)
             {
                 //Log and continue execution
-                LogErrorEvent("Error Inserting/Updating JIRA Issue in " + productName + " as a requirement: " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Error);
+                LogErrorEvent("Error Inserting/Updating JIRA Issue " + jiraIssue.Key.ToString() + " in " + productName + " as a requirement: " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Error);
             }
         }
 
@@ -2164,8 +2170,30 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     jiraIssue.Fields.Security = new SecurityLevel(securityLevelId.ToString());
                 }
                 JiraIssueLink jiraIssueLink = jiraManager.CreateIssue(jiraIssue, this.jiraCreateMetaData);
+                LogTraceEvent(eventLog, "Created JIRA issue with key " + jiraIssueLink.Key.ToString(), EventLogEntryType.Information);
+
+                try
+                {
+                    //Next see if we have any comments to add to JIRA
+                    RemoteComment[] remoteComments = spiraImportExport.Incident_RetrieveComments(incidentId);
+                    if (remoteComments != null && remoteComments.Length > 0)
+                    {
+                        foreach (RemoteComment remoteComment in remoteComments)
+                        {
+                            string body = InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text);
+                            jiraManager.AddComment(jiraIssueLink.Key.ToString(), body);
+                        }
+                    }
+                }
+                catch (Exception exception)
+                {
+                    //Log a message that describes why it's not working
+                    LogErrorEvent("Unable to add a comment to the " + productName + " incident in JIRA, error was: " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Warning);
+                    //Just continue with the rest since it's optional.
+                }
 
                 //Add attachments to the issue if appropriate
+                LogTraceEvent(eventLog, "Checking for attachments to add to JIRA.", EventLogEntryType.Information);
                 if (remoteDocuments != null)
                 {
                     foreach (SpiraSoapService.RemoteDocument remoteDocument in remoteDocuments)
@@ -2342,6 +2370,649 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                             spiraImportExport.Incident_Update(remoteIncident);
                         }
                     }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Processes an updated SpiraTest incident record
+        /// </summary>
+        /// <param name="remoteIncident">The Spira incident</param>
+        private void ProcessUpdatedIncident(int projectId, SoapServiceClient spiraImportExport, RemoteIncident remoteIncident, List<RemoteDataMapping> newReleaseMappings, Dictionary<int, RemoteDataMapping> customPropertyMappingList, Dictionary<int, RemoteDataMapping[]> customPropertyValueMappingList, RemoteCustomProperty[] incidentCustomProperties, RemoteDataMapping[] incidentMappings, JiraProject jiraProject, JiraManager jiraManager, string productName, RemoteDataMapping[] severityMappings, RemoteDataMapping[] priorityMappings, RemoteDataMapping[] statusMappings, RemoteDataMapping[] typeMappings, RemoteDataMapping[] userMappings, RemoteDataMapping[] releaseMappings, RemoteDataMapping[] incidentComponentMappings, List<string> recentlyUpdatedFromJira)
+        {
+            //Get certain incident fields into local variables (if used more than once)
+            int incidentId = remoteIncident.IncidentId.Value;
+            int incidentStatusId = remoteIncident.IncidentStatusId.Value;
+
+            //Make sure we've have already loaded this issue and that it wasn't recently updated in JIRA (would cause endless updates)
+            RemoteDataMapping incidentMapping = InternalFunctions.FindMappingByInternalId(projectId, incidentId, incidentMappings);
+            if (incidentMapping != null && !recentlyUpdatedFromJira.Contains(incidentMapping.ExternalKey))
+            {
+                LogTraceEvent(eventLog, "Updating JIRA issue " + incidentMapping.ExternalKey + " for " + productName + " incident IN" + incidentId + "\n", EventLogEntryType.Information);
+
+                //Convert the incident description from HTML > Plain Text
+                string baseUrl = spiraImportExport.System_GetWebServerUrl();
+                LogTraceEvent("Rich Text description = " + remoteIncident.Description);
+                string description = InternalFunctions.HtmlRenderAsPlainText(remoteIncident.Description);
+                LogTraceEvent("Plain Text description = " + description);
+
+                //Find the matching JIRA issue
+                JiraIssue jiraIssue = null;
+                try
+                {
+                    jiraIssue = jiraManager.GetIssueByKey(incidentMapping.ExternalKey, this.jiraCreateMetaData);
+                }
+                catch (Exception exception)
+                {
+                    LogErrorEvent("Unable to retrieve JIRA issue " + incidentMapping.ExternalKey + " - " + exception.Message);
+                }
+
+                //Make sure it exists
+                if (jiraIssue != null)
+                {
+                    //Need to track if status changed because that requires JIRA to execute a transition
+                    bool statusChanged = false;
+
+                    jiraIssue.Fields.Summary = remoteIncident.Name;
+                    jiraIssue.Fields.Description = description;
+                    LogTraceEvent(eventLog, "Created JIRA issue and populated Summary and Description\n", EventLogEntryType.Information);
+
+                    //Populate the due-date
+                    if (remoteIncident.StartDate.HasValue)
+                    {
+                        jiraIssue.Fields.DueDate = remoteIncident.StartDate.Value;
+                        LogTraceEvent(eventLog, "Populated Due-Date\n", EventLogEntryType.Information);
+                    }
+
+                    //Populate the resolution-date
+                    if (remoteIncident.ClosedDate.HasValue)
+                    {
+                        jiraIssue.Fields.ResolutionDate = remoteIncident.ClosedDate.Value;
+                        LogTraceEvent(eventLog, "Populated Resolution-Date\n", EventLogEntryType.Information);
+                    }
+
+                    //Now get the issue type from the mapping
+                    SpiraSoapService.RemoteDataMapping dataMapping = InternalFunctions.FindMappingByInternalId(projectId, remoteIncident.IncidentTypeId.Value, typeMappings);
+                    if (dataMapping == null)
+                    {
+                        //We can't find the matching item so log and move to the next incident
+                        LogErrorEvent("Unable to locate mapping entry for incident type " + remoteIncident.IncidentTypeId + " in project " + projectId, EventLogEntryType.Error);
+                        return;
+                    }
+
+                    jiraIssue.Fields.IssueType = new IssueType(dataMapping.ExternalKey);
+                    LogTraceEvent(eventLog, "Set issue type\n", EventLogEntryType.Information);
+
+                    //Now get the issue status from the mapping
+                    dataMapping = InternalFunctions.FindMappingByInternalId(projectId, remoteIncident.IncidentStatusId.Value, statusMappings);
+                    if (dataMapping == null)
+                    {
+                        //We can't find the matching item so log and move to the next incident
+                        LogErrorEvent("Unable to locate mapping entry for incident status " + remoteIncident.IncidentStatusId + " in project " + projectId, EventLogEntryType.Error);
+                        return;
+                    }
+                    if (jiraIssue.Fields.Status.IdString != dataMapping.ExternalKey)
+                    {
+                        jiraIssue.Fields.Status = new Status(dataMapping.ExternalKey);
+                        statusChanged = true;
+                    }
+                    LogTraceEvent(eventLog, "Set issue status\n", EventLogEntryType.Information);
+
+                    //Now get the issue priority from the mapping (if priority is set)
+                    if (remoteIncident.PriorityId.HasValue)
+                    {
+                        dataMapping = InternalFunctions.FindMappingByInternalId(projectId, remoteIncident.PriorityId.Value, priorityMappings);
+                        if (dataMapping == null)
+                        {
+                            //We can't find the matching item so log and just don't set the priority
+                            LogErrorEvent("Unable to locate mapping entry for incident priority " + remoteIncident.PriorityId.Value + " in project " + projectId, EventLogEntryType.Warning);
+                        }
+                        else
+                        {
+                            jiraIssue.Fields.Priority = new Priority(dataMapping.ExternalKey);
+                        }
+                    }
+
+                    //Get a list of JIRA components in the project (used in custom properties)
+                    List<JiraComponent> jiraComponents = jiraManager.GetComponents(jiraProject.Key);
+
+                    //Now get the components from the mapping (introduced in Spira 5.0 instead of using a special custom property)
+                    if (remoteIncident.ComponentIds != null && remoteIncident.ComponentIds.Length > 0)
+                    {
+                        List<JiraComponent> jiraIssueComponents = new List<JiraComponent>();
+                        foreach (int componentId in remoteIncident.ComponentIds)
+                        {
+                            dataMapping = InternalFunctions.FindMappingByInternalId(projectId, componentId, incidentComponentMappings);
+                            if (dataMapping != null)
+                            {
+                                //Make sure this is actually a JIRA component
+                                if (jiraComponents.Any(c => c.IdString == dataMapping.ExternalKey))
+                                {
+                                    jiraIssueComponents.Add(new JiraComponent(dataMapping.ExternalKey));
+                                }
+                            }
+                        }
+                        jiraIssue.Fields.Components = jiraIssueComponents;
+                    }
+                    //Debug logging - comment out for production code
+                    LogTraceEvent(eventLog, "Got the component\n", EventLogEntryType.Information);
+
+                    //Now set the reporter of the issue
+                    dataMapping = FindUserMappingByInternalId(remoteIncident.OpenerId.Value, userMappings, spiraImportExport);
+                    if (dataMapping == null)
+                    {
+                        //We can't find the matching user so just use the external login
+                        LogErrorEvent("Unable to locate mapping entry for opener user id " + remoteIncident.OpenerId + " so using the synchronization user for reporter", EventLogEntryType.Warning);
+                        jiraIssue.Fields.Reporter = new User(externalLogin);
+                    }
+                    else
+                    {
+                        jiraIssue.Fields.Reporter = new User(dataMapping.ExternalKey);
+                        LogTraceEvent(eventLog, "Set issue reporter\n", EventLogEntryType.Information);
+                    }
+
+                    //Now set the assignee - set NULL if no assignee (owner) in SpiraTest
+                    if (remoteIncident.OwnerId.HasValue)
+                    {
+                        dataMapping = FindUserMappingByInternalId(remoteIncident.OwnerId.Value, userMappings, spiraImportExport);
+                        if (dataMapping == null)
+                        {
+                            //We can't find the matching user so just use the external login
+                            LogErrorEvent("Unable to locate mapping entry for owner user id " + remoteIncident.OwnerId.Value + " so using the synchronization user for assignee", EventLogEntryType.Warning);
+                            jiraIssue.Fields.Assignee = new User(externalLogin);
+                        }
+                        else
+                        {
+                            jiraIssue.Fields.Assignee = new User(dataMapping.ExternalKey);
+                            LogTraceEvent(eventLog, "Set issue assignee\n", EventLogEntryType.Information);
+                        }
+                    }
+                    else
+                    {
+                        jiraIssue.Fields.Assignee = null;
+                        LogTraceEvent(eventLog, "Set issue as unassigneed\n", EventLogEntryType.Information);
+                    }
+
+                    //Specify the detected-in version/release if applicable
+                    if (remoteIncident.DetectedReleaseId.HasValue)
+                    {
+                        int detectedReleaseId = remoteIncident.DetectedReleaseId.Value;
+                        dataMapping = InternalFunctions.FindMappingByInternalId(projectId, detectedReleaseId, releaseMappings);
+                        if (dataMapping == null)
+                        {
+                            //See if it's a newly added version in this sync cycle
+                            dataMapping = InternalFunctions.FindMappingByInternalId(projectId, detectedReleaseId, newReleaseMappings.ToArray());
+                        }
+                        string jiraVersionId = null;
+                        if (dataMapping == null)
+                        {
+                            //We can't find the matching item so need to create a new version in JIRA and add to mappings
+                            //Since version numbers are now unique in both systems, we can simply use that
+                            LogTraceEvent(eventLog, "Adding new version in jira for release " + detectedReleaseId + "\n", EventLogEntryType.Information);
+                            JiraVersion jiraVersion = new JiraVersion();
+                            jiraVersion.Project = jiraProject.Key;
+                            jiraVersion.Name = remoteIncident.DetectedReleaseVersionNumber;
+                            jiraVersion.Archived = false;
+                            jiraVersion.Released = false;
+                            jiraVersion = jiraManager.AddVersion(jiraVersion);
+
+                            //Add a new mapping entry
+                            SpiraSoapService.RemoteDataMapping newReleaseMapping = new SpiraSoapService.RemoteDataMapping();
+                            newReleaseMapping.ProjectId = projectId;
+                            newReleaseMapping.InternalId = detectedReleaseId;
+                            newReleaseMapping.ExternalKey = jiraVersion.Id.ToString();
+                            newReleaseMappings.Add(newReleaseMapping);
+                            jiraVersionId = jiraVersion.Id.ToString();
+                        }
+                        else
+                        {
+                            jiraVersionId = dataMapping.ExternalKey;
+                        }
+                        //Get the list of versions from the server and find the one that corresponds to the SpiraTest Release
+                        LogTraceEvent(eventLog, "Looking for JIRA affected version: " + jiraVersionId + "\n", EventLogEntryType.Information);
+                        List<JiraVersion> jiraVersions = jiraManager.GetVersions(jiraProject.Key);
+                        if (jiraVersions != null && jiraVersions.Count > 0)
+                        {
+                            bool matchFound = false;
+                            foreach (JiraVersion jiraVersion in jiraVersions)
+                            {
+                                //See if we have an match, if not remove
+                                if (jiraVersion.Id.ToString() == jiraVersionId)
+                                {
+                                    if (jiraIssue.Fields.Versions == null)
+                                    {
+                                        jiraIssue.Fields.Versions = new List<JiraVersion>();
+                                    }
+                                    jiraIssue.Fields.Versions.Add(jiraVersion);
+                                    LogTraceEvent(eventLog, "Found JIRA affected version: " + jiraVersionId + "\n", EventLogEntryType.Information);
+                                    matchFound = true;
+                                }
+                            }
+                            if (!matchFound)
+                            {
+                                //We can't find the matching item so log and just don't set the release
+                                LogErrorEvent("Unable to locate JIRA affected version " + jiraVersionId + " in project " + jiraProject, EventLogEntryType.Warning);
+                            }
+                        }
+                        else
+                        {
+                            LogTraceEvent(eventLog, "No versions retrieved from JIRA" + "\n", EventLogEntryType.Information);
+                        }
+                    }
+                    LogTraceEvent(eventLog, "Set issue affected version\n", EventLogEntryType.Information);
+
+                    //Specify the resolved-in version/release if applicable
+                    if (remoteIncident.ResolvedReleaseId.HasValue)
+                    {
+                        int resolvedReleaseId = remoteIncident.ResolvedReleaseId.Value;
+                        dataMapping = InternalFunctions.FindMappingByInternalId(projectId, resolvedReleaseId, releaseMappings);
+                        if (dataMapping == null)
+                        {
+                            //See if it's a newly added version in this sync cycle
+                            dataMapping = InternalFunctions.FindMappingByInternalId(projectId, resolvedReleaseId, newReleaseMappings.ToArray());
+                        }
+                        string jiraVersionId = null;
+                        if (dataMapping == null)
+                        {
+                            //We can't find the matching item so need to create a new version in JIRA and add to mappings
+                            //Since version numbers are now unique in both systems, we can simply use that
+                            LogTraceEvent(eventLog, "Adding new version in jira for release " + resolvedReleaseId + "\n", EventLogEntryType.Information);
+                            JiraVersion jiraVersion = new JiraVersion();
+                            jiraVersion.Name = remoteIncident.ResolvedReleaseVersionNumber;
+                            jiraVersion.Project = jiraProject.Key;
+                            jiraVersion.Archived = false;
+                            jiraVersion.Released = false;
+                            jiraVersion = jiraManager.AddVersion(jiraVersion);
+
+                            //Add a new mapping entry
+                            SpiraSoapService.RemoteDataMapping newReleaseMapping = new SpiraSoapService.RemoteDataMapping();
+                            newReleaseMapping.ProjectId = projectId;
+                            newReleaseMapping.InternalId = resolvedReleaseId;
+                            newReleaseMapping.ExternalKey = jiraVersion.Id.ToString();
+                            newReleaseMappings.Add(newReleaseMapping);
+                            jiraVersionId = jiraVersion.Id.ToString();
+                        }
+                        else
+                        {
+                            jiraVersionId = dataMapping.ExternalKey;
+                        }
+                        //Get the list of versions from the server and find the one that corresponds to the SpiraTest Release
+                        List<JiraVersion> jiraVersions = jiraManager.GetVersions(jiraProject.Key);
+                        LogTraceEvent(eventLog, "Looking for JIRA fix version: " + jiraVersionId + "\n", EventLogEntryType.Information);
+                        if (jiraVersions != null && jiraVersions.Count > 0)
+                        {
+                            bool matchFound = false;
+                            foreach (JiraVersion jiraVersion in jiraVersions)
+                            {
+                                //See if we have an match, if not remove
+                                if (jiraVersion.Id.ToString() == jiraVersionId)
+                                {
+                                    if (jiraIssue.Fields.FixVersions == null)
+                                    {
+                                        jiraIssue.Fields.FixVersions = new List<JiraVersion>();
+                                    }
+                                    jiraIssue.Fields.FixVersions.Add(jiraVersion);
+                                    LogTraceEvent(eventLog, "Found JIRA fix version: " + jiraVersionId + "\n", EventLogEntryType.Information);
+                                    matchFound = true;
+                                }
+                            }
+                            if (!matchFound)
+                            {
+                                //We can't find the matching item so log and just don't set the release
+                                LogErrorEvent("Unable to locate JIRA fix version " + jiraVersionId + " in project " + jiraProject, EventLogEntryType.Warning);                            }
+                        }
+                        else
+                        {
+                            LogTraceEvent(eventLog, "No versions retrieved from JIRA" + "\n", EventLogEntryType.Information);
+                        }
+                    }
+                    LogTraceEvent(eventLog, "Set issue fix version\n", EventLogEntryType.Information);
+
+                    //Setup the dictionary to hold the various custom properties to set on the Jira issue
+                    Dictionary<int, CustomPropertyValue> customPropertyValues = new Dictionary<int, CustomPropertyValue>();
+
+                    //Now iterate through the incident custom properties
+                    long securityLevelId = 0;
+                    if (remoteIncident.CustomProperties != null && remoteIncident.CustomProperties.Length > 0)
+                    {
+                        foreach (RemoteArtifactCustomProperty artifactCustomProperty in remoteIncident.CustomProperties)
+                        {
+                            //Handle user, list and non-list separately since only the list types need to have value mappings
+                            RemoteCustomProperty customProperty = artifactCustomProperty.Definition;
+                            if (customProperty != null && customProperty.CustomPropertyId.HasValue)
+                            {
+                                if (customProperty.CustomPropertyTypeId == (int)Constants.CustomPropertyType.List)
+                                {
+                                    //Single-Select List
+                                    LogTraceEvent(eventLog, "Checking list custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+
+                                    //See if we have a custom property value set
+                                    //Get the corresponding external custom field (if there is one)
+                                    if (artifactCustomProperty.IntegerValue.HasValue && customPropertyMappingList != null && customPropertyMappingList.ContainsKey(customProperty.CustomPropertyId.Value))
+                                    {
+                                        LogTraceEvent(eventLog, "Got value for list custom property: " + customProperty.Name + " (" + artifactCustomProperty.IntegerValue.Value + ")\n", EventLogEntryType.Information);
+                                        SpiraSoapService.RemoteDataMapping customPropertyDataMapping = customPropertyMappingList[customProperty.CustomPropertyId.Value];
+                                        if (customPropertyDataMapping != null)
+                                        {
+                                            string externalCustomField = customPropertyDataMapping.ExternalKey;
+
+                                            //Get the corresponding external custom field value (if there is one)
+                                            if (!String.IsNullOrEmpty(externalCustomField) && customPropertyValueMappingList.ContainsKey(customProperty.CustomPropertyId.Value))
+                                            {
+                                                SpiraSoapService.RemoteDataMapping[] customPropertyValueMappings = customPropertyValueMappingList[customProperty.CustomPropertyId.Value];
+                                                if (customPropertyValueMappings != null)
+                                                {
+                                                    SpiraSoapService.RemoteDataMapping customPropertyValueMapping = InternalFunctions.FindMappingByInternalId(projectId, artifactCustomProperty.IntegerValue.Value, customPropertyValueMappings);
+                                                    if (customPropertyValueMapping != null)
+                                                    {
+                                                        string externalCustomFieldValue = customPropertyValueMapping.ExternalKey;
+
+                                                        //See if we have one of the special standard Jira field that it maps to
+                                                        if (!String.IsNullOrEmpty(externalCustomFieldValue))
+                                                        {
+                                                            if (externalCustomField == JIRA_SPECIAL_FIELD_COMPONENT)
+                                                            {
+                                                                //Make sure we've not already handled the components using the new Spira standard field
+                                                                if (remoteIncident.ComponentIds == null || remoteIncident.ComponentIds.Length == 0)
+                                                                {
+                                                                    //Now set the value of the jira issue's component
+                                                                    JiraComponent jiraComponent = new JiraComponent(externalCustomFieldValue);
+                                                                    LogTraceEvent(eventLog, "Added JIRA component: " + jiraComponent.IdString + "\n", EventLogEntryType.Information);
+                                                                    if (jiraIssue.Fields.Components == null)
+                                                                    {
+                                                                        jiraIssue.Fields.Components = new List<JiraComponent>();
+                                                                    }
+                                                                    jiraIssue.Fields.Components.Add(jiraComponent);
+                                                                }
+                                                            }
+                                                            else if (externalCustomField == JIRA_SPECIAL_FIELD_RESOLUTION)
+                                                            {
+                                                                //Now set the value of the jira issue's resolution
+                                                                LogTraceEvent(eventLog, "Added JIRA resolution: " + externalCustomFieldValue + ")\n", EventLogEntryType.Information);
+                                                                jiraIssue.Fields.Resolution = new Resolution(externalCustomFieldValue);
+                                                            }
+                                                            else if (externalCustomField == JIRA_SPECIAL_FIELD_SECURITY_LEVEL)
+                                                            {
+                                                                //Now set the value of the jira issue's security level id
+                                                                long externalCustomFieldLongValue;
+                                                                if (Int64.TryParse(externalCustomFieldValue, out externalCustomFieldLongValue))
+                                                                {
+                                                                    securityLevelId = externalCustomFieldLongValue;
+                                                                }
+                                                                else
+                                                                {
+                                                                    LogErrorEvent("The Security Level external key '" + externalCustomFieldValue + "' needs to be an integer, so ignoring", EventLogEntryType.Warning);
+                                                                }
+                                                            }
+                                                            else
+                                                            {
+                                                                int customFieldId;
+                                                                if (Int32.TryParse(externalCustomField, out customFieldId))
+                                                                {
+                                                                    //This needs to be added to the list of JIRA custom properties
+                                                                    CustomPropertyValue cpv = new CustomPropertyValue();
+                                                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.List;
+                                                                    cpv.StringValue = externalCustomFieldValue;
+                                                                    customPropertyValues.Add(customFieldId, cpv);
+                                                                    LogTraceEvent(eventLog, "Added single-list custom property field value: " + customProperty.Name + " (Value=" + externalCustomFieldValue + ")\n", EventLogEntryType.Information);
+                                                                }
+                                                                else
+                                                                {
+                                                                    LogErrorEvent("Unable to set a value on JIRA custom field '" + externalCustomField + "' because the custom field id is not an integer.", EventLogEntryType.Warning);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    LogTraceEvent(eventLog, "Finished with list custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+
+                                }
+                                else if (customProperty.CustomPropertyTypeId == (int)Constants.CustomPropertyType.MultiList)
+                                {
+                                    //Multi-Select List
+                                    LogTraceEvent(eventLog, "Checking multi-list custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+
+                                    //See if we have a custom property value set
+                                    //Get the corresponding external custom field (if there is one)
+                                    if (artifactCustomProperty.IntegerListValue != null && artifactCustomProperty.IntegerListValue.Length > 0 && customPropertyMappingList != null && customPropertyMappingList.ContainsKey(customProperty.CustomPropertyId.Value))
+                                    {
+                                        LogTraceEvent(eventLog, "Got values for multi-list custom property: " + customProperty.Name + " (Count=" + artifactCustomProperty.IntegerListValue.Length + ")\n", EventLogEntryType.Information);
+                                        SpiraSoapService.RemoteDataMapping customPropertyDataMapping = customPropertyMappingList[customProperty.CustomPropertyId.Value];
+                                        if (customPropertyDataMapping != null && !String.IsNullOrEmpty(customPropertyDataMapping.ExternalKey))
+                                        {
+                                            string externalCustomField = customPropertyDataMapping.ExternalKey;
+                                            LogTraceEvent(eventLog, "Got external key for multi-list custom property: " + customProperty.Name + " = " + externalCustomField + "\n", EventLogEntryType.Information);
+
+                                            //Loop through each value in the list
+                                            List<string> externalCustomFieldValues = new List<string>();
+                                            foreach (int customPropertyListValue in artifactCustomProperty.IntegerListValue)
+                                            {
+                                                //Get the corresponding external custom field value (if there is one)
+                                                if (customPropertyValueMappingList.ContainsKey(customProperty.CustomPropertyId.Value))
+                                                {
+                                                    SpiraSoapService.RemoteDataMapping[] customPropertyValueMappings = customPropertyValueMappingList[customProperty.CustomPropertyId.Value];
+                                                    if (customPropertyValueMappings != null)
+                                                    {
+                                                        SpiraSoapService.RemoteDataMapping customPropertyValueMapping = InternalFunctions.FindMappingByInternalId(projectId, customPropertyListValue, customPropertyValueMappings);
+                                                        if (customPropertyValueMapping != null)
+                                                        {
+                                                            LogTraceEvent(eventLog, "Added multi-list custom property field value: " + customProperty.Name + " (Value=" + customPropertyValueMapping.ExternalKey + ")\n", EventLogEntryType.Information);
+                                                            externalCustomFieldValues.Add(customPropertyValueMapping.ExternalKey);
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            //See if we have one of the special standard Jira field that it maps to
+                                            LogTraceEvent(eventLog, "Got mapped values for multi-list custom property: " + customProperty.Name + " (Count=" + externalCustomFieldValues.Count + ")\n", EventLogEntryType.Information);
+                                            if (externalCustomFieldValues.Count > 0)
+                                            {
+                                                if (externalCustomField == JIRA_SPECIAL_FIELD_COMPONENT)
+                                                {
+                                                    LogTraceEvent(eventLog, "Custom property is special JIRA Component field.\n", EventLogEntryType.Information);
+                                                    //Now set the value of the jira issue's component
+                                                    foreach (string externalCustomFieldValue in externalCustomFieldValues)
+                                                    {
+                                                        //Need to get the component ID from the value
+                                                        if (jiraComponents != null)
+                                                        {
+                                                            JiraComponent jiraComponent = jiraComponents.FirstOrDefault(c => c.Name == externalCustomFieldValue);
+                                                            if (jiraComponent != null)
+                                                            {
+                                                                LogTraceEvent(eventLog, "Added JIRA component: " + jiraComponent.IdString + "\n", EventLogEntryType.Information);
+                                                                JiraComponent newJiraComponent = new JiraComponent(jiraComponent.IdString);
+                                                                if (jiraIssue.Fields.Components == null)
+                                                                {
+                                                                    jiraIssue.Fields.Components = new List<JiraComponent>();
+                                                                }
+                                                                jiraIssue.Fields.Components.Add(newJiraComponent);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                else
+                                                {
+                                                    int customFieldId;
+                                                    if (Int32.TryParse(externalCustomField, out customFieldId))
+                                                    {
+                                                        //This needs to be added to the list of JIRA custom properties
+                                                        CustomPropertyValue cpv = new CustomPropertyValue();
+                                                        cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.MultiList;
+                                                        cpv.MultiListValue = new List<string>();
+                                                        foreach (string externalCustomFieldValue in externalCustomFieldValues)
+                                                        {
+                                                            cpv.MultiListValue.Add(externalCustomFieldValue);
+                                                        }
+                                                        customPropertyValues.Add(customFieldId, cpv);
+                                                    }
+                                                    else
+                                                    {
+                                                        LogErrorEvent("Unable to set a value on JIRA custom field '" + externalCustomField + "' because the custom field id is not an integer.", EventLogEntryType.Warning);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    LogTraceEvent(eventLog, "Finished with multi-list custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+                                }
+                                else if (customProperty.CustomPropertyTypeId == (int)Constants.CustomPropertyType.User)
+                                {
+                                    LogTraceEvent(eventLog, "Checking user custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+                                    //See if we have a custom property value set
+                                    if (artifactCustomProperty.IntegerValue.HasValue)
+                                    {
+                                        SpiraSoapService.RemoteDataMapping customPropertyDataMapping = customPropertyMappingList[customProperty.CustomPropertyId.Value];
+                                        if (customPropertyDataMapping != null && !String.IsNullOrEmpty(customPropertyDataMapping.ExternalKey))
+                                        {
+                                            string externalCustomField = customPropertyDataMapping.ExternalKey;
+                                            LogTraceEvent(eventLog, "Got external key for user custom property: " + customProperty.Name + " = " + externalCustomField + "\n", EventLogEntryType.Information);
+
+                                            LogTraceEvent(eventLog, "Got value for user custom property: " + customProperty.Name + " (" + artifactCustomProperty.IntegerValue.Value + ")\n", EventLogEntryType.Information);
+                                            //Get the corresponding JIRA user (if there is one)
+                                            dataMapping = FindUserMappingByInternalId(artifactCustomProperty.IntegerValue.Value, userMappings, spiraImportExport);
+                                            if (dataMapping != null)
+                                            {
+                                                int customFieldId;
+                                                if (Int32.TryParse(externalCustomField, out customFieldId))
+                                                {
+                                                    //This needs to be added to the list of JIRA custom properties
+                                                    CustomPropertyValue cpv = new CustomPropertyValue();
+                                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.User;
+                                                    cpv.StringValue = dataMapping.ExternalKey;
+                                                    customPropertyValues.Add(customFieldId, cpv);
+                                                    LogTraceEvent(eventLog, "Added user custom property field value: " + customProperty.Name + " (Value=" + dataMapping.ExternalKey + ")\n", EventLogEntryType.Information);
+                                                }
+                                                else
+                                                {
+                                                    LogErrorEvent("Unable to set a value on JIRA custom field '" + externalCustomField + "' because the custom field id is not an integer.", EventLogEntryType.Warning);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                LogErrorEvent("Unable to find a matching JIRA user for " + productName + " user with ID=" + artifactCustomProperty.IntegerValue.Value + " so leaving property null.", EventLogEntryType.Warning);
+                                            }
+                                        }
+                                    }
+                                    LogTraceEvent(eventLog, "Finished with user custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+                                }
+                                else
+                                {
+                                    LogTraceEvent(eventLog, "Checking non-list custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+                                    //See if we have a custom property value set
+                                    if (!String.IsNullOrEmpty(artifactCustomProperty.StringValue) || artifactCustomProperty.BooleanValue.HasValue
+                                        || artifactCustomProperty.DateTimeValue.HasValue || artifactCustomProperty.DecimalValue.HasValue
+                                        || artifactCustomProperty.IntegerValue.HasValue)
+                                    {
+                                        LogTraceEvent(eventLog, "Got value for non-list custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+                                        //Get the corresponding external custom field (if there is one)
+                                        if (customPropertyMappingList != null && customPropertyMappingList.ContainsKey(customProperty.CustomPropertyId.Value))
+                                        {
+                                            SpiraSoapService.RemoteDataMapping customPropertyDataMapping = customPropertyMappingList[customProperty.CustomPropertyId.Value];
+                                            if (customPropertyDataMapping != null)
+                                            {
+                                                string externalCustomField = customPropertyDataMapping.ExternalKey;
+
+                                                //See if we have one of the special standard Jira field that it maps to
+                                                if (!String.IsNullOrEmpty(externalCustomField))
+                                                {
+                                                    if (externalCustomField == JIRA_SPECIAL_FIELD_ENVIRONMENT)
+                                                    {
+                                                        jiraIssue.Fields.Environment = artifactCustomProperty.StringValue;
+                                                    }
+                                                    else if (externalCustomField == JIRA_SPECIAL_FIELD_ISSUE_KEY)
+                                                    {
+                                                        //Handled later
+                                                    }
+                                                    else
+                                                    {
+                                                        int customFieldId;
+                                                        if (Int32.TryParse(externalCustomField, out customFieldId))
+                                                        {
+                                                            //This needs to be added to the list of JIRA custom properties
+                                                            customPropertyValues.Add(customFieldId, new CustomPropertyValue(artifactCustomProperty));
+                                                        }
+                                                        else
+                                                        {
+                                                            LogErrorEvent("Unable to set a value on JIRA custom field '" + externalCustomField + "' because the custom field id is not an integer.", EventLogEntryType.Warning);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    LogTraceEvent(eventLog, "Finished with text custom property: " + customProperty.Name + "\n", EventLogEntryType.Information);
+                                }
+                            }
+                        }
+                    }
+                    LogTraceEvent(eventLog, "Finished processing issue custom values\n", EventLogEntryType.Information);
+
+                    //The special case of SpiraTest Severity needs to be checked
+                    //This allows us to populate a Jira custom field from the standard SpiraTest Severity field
+                    if (severityCustomFieldId.HasValue && remoteIncident.SeverityId.HasValue)
+                    {
+                        dataMapping = InternalFunctions.FindMappingByInternalId(projectId, remoteIncident.SeverityId.Value, severityMappings);
+                        if (dataMapping == null)
+                        {
+                            //We can't find the matching item so log and just don't set the severity
+                            LogErrorEvent("Unable to locate mapping entry for incident severity " + remoteIncident.SeverityId.Value + " in project " + projectId, EventLogEntryType.Warning);
+                        }
+                        else
+                        {
+                            //Set the appropriate custom property in JIRA
+                            string severityCustomFieldValueId = dataMapping.ExternalKey;
+                            LogTraceEvent(eventLog, "Added severity to JIRA custom property field: id=" + severityCustomFieldId.Value + " (Value=" + severityCustomFieldValueId + ")\n", EventLogEntryType.Information);
+                            CustomPropertyValue cpv = new CustomPropertyValue();
+                            cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.List;
+                            cpv.StringValue = severityCustomFieldValueId;
+                            customPropertyValues.Add(severityCustomFieldId.Value, cpv);
+                        }
+                        LogTraceEvent(eventLog, "Set issue custom severity\n", EventLogEntryType.Information);
+                    }
+
+                    //Now populate all the custom property values onto the Jira issue object
+                    if (customPropertyValues.Count > 0)
+                    {
+                        foreach (KeyValuePair<int, CustomPropertyValue> customPropertyValue in customPropertyValues)
+                        {
+                            JiraCustomFieldValue customFieldValue = new JiraCustomFieldValue(customPropertyValue.Key);
+                            customFieldValue.Value = customPropertyValue.Value;
+                            jiraIssue.CustomFieldValues.Add(customFieldValue);
+                        }
+                        LogTraceEvent(eventLog, "Set custom values onto JIRA issue object\n", EventLogEntryType.Information);
+                    }
+
+                    //Next see if we have any comments to add to JIRA
+                    //We need to make sure we don't add duplicate ones
+                    RemoteComment[] remoteComments = spiraImportExport.Incident_RetrieveComments(incidentId);
+                    if (remoteComments != null && remoteComments.Length > 0)
+                    {
+                        try
+                        {
+                            foreach (RemoteComment remoteComment in remoteComments)
+                            {
+                                bool alreadyAdded = jiraIssue.Fields.Comment.Comments.Any(c => c.Body.Trim() == (InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text).Trim()));
+
+                                if (!alreadyAdded)
+                                {
+                                    string body = InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text);
+                                    jiraManager.AddComment(jiraIssue.Key.ToString(), body);
+                                }
+                            }
+                        }
+                        catch (Exception exception)
+                        {
+                            //Log a message that describes why it's not working
+                            LogErrorEvent("Unable to add a comment to the " + productName + " incident in JIRA, error was: " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Warning);
+                            //Just continue with the rest since it's optional.
+                        }
+                    }
+
+                    //Finally update the issue
+                    jiraManager.SaveIssue(jiraIssue, statusChanged);
                 }
             }
         }
@@ -2529,7 +3200,6 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     }
                     LogTraceEvent(eventLog, "Found " + incidentList.Count + " new incidents in " + productName, EventLogEntryType.Information);
 
-
                     //Create the mapping collections to hold any new items that need to get added to the mappings
                     //or any old items that need to get removed from the mappings
                     List<RemoteDataMapping> newIncidentMappings = new List<SpiraSoapService.RemoteDataMapping>();
@@ -2634,6 +3304,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     }
 
                     //Iterate through these items
+                    List<string> updatedJiraIds = new List<string>();
                     foreach (JiraIssue jiraIssue in jiraIssues)
                     {
                         //Make sure the projects match
@@ -2647,6 +3318,10 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                             else
                             {
                                 ProcessJiraIssueAsIncident(projectId, spiraImportExport, jiraIssue, newIncidentMappings, newReleaseMappings, oldReleaseMappings, incidentCustomPropertyMappingList, incidentCustomPropertyValueMappingList, incidentCustomProperties, incidentMappings, jiraProject.Key, jiraManager, productName, incidentSeverityMappings, incidentPriorityMappings, incidentStatusMappings, incidentTypeMappings, userMappings, releaseMappings, incidentComponentMappings);
+                                if (this.bidirectionalIncidentSync)
+                                {
+                                    updatedJiraIds.Add(jiraIssue.Key.ToString());
+                                }
                             }
                         }
                     }
@@ -2672,6 +3347,53 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     spiraImportExport.DataMapping_AddArtifactMappings(dataSyncSystemId, (int)Constants.ArtifactType.Release, newReleaseMappings.ToArray());
                     spiraImportExport.DataMapping_AddArtifactMappings(dataSyncSystemId, (int)Constants.ArtifactType.Incident, newIncidentMappings.ToArray());
                     spiraImportExport.DataMapping_AddArtifactMappings(dataSyncSystemId, (int)Constants.ArtifactType.Requirement, newRequirementMappings.ToArray());
+
+                    //If we have the full directional sync option enabled, we also update in the reverse direction (Spira > Jira)
+                    //and add comments in the reverse direction
+                    if (this.bidirectionalIncidentSync)
+                    {
+                        //Refresh the artifact mappings
+                        incidentMappings = spiraImportExport.DataMapping_RetrieveArtifactMappings(dataSyncSystemId, (int)Constants.ArtifactType.Incident);
+                        releaseMappings = spiraImportExport.DataMapping_RetrieveArtifactMappings(dataSyncSystemId, (int)Constants.ArtifactType.Release);
+
+                        //We may still need to add new releases (that we didn't already find)
+                        newReleaseMappings = new List<SpiraSoapService.RemoteDataMapping>();
+
+                        //Get the updated incidents in batches of 100                        
+                        RemoteFilter incidentUpdatedFilter = new RemoteFilter();
+                        incidentUpdatedFilter.PropertyName = "LastUpdateDate";
+                        incidentUpdatedFilter.DateRangeValue = new SpiraSoapService.DateRange() { ConsiderTimes = true, StartDate = lastSyncDate };
+                        RemoteFilter[] incidentUpdatedFilters = new RemoteFilter[1] { incidentUpdatedFilter };
+                        RemoteSort incidentSort = new RemoteSort();
+                        incidentSort.PropertyName = "LastUpdateDate";
+                        incidentSort.SortAscending = true;
+                        List<RemoteIncident> updatedIncidents = new List<RemoteIncident>();
+                        long updatedIncidentsCount = spiraImportExport.Incident_Count(incidentUpdatedFilters);
+                        for (int startRow = 1; startRow <= updatedIncidentsCount; startRow += Constants.INCIDENT_PAGE_SIZE_SPIRA)
+                        {
+                            RemoteIncident[] incidentBatch = spiraImportExport.Incident_Retrieve(incidentUpdatedFilters, incidentSort, startRow, Constants.INCIDENT_PAGE_SIZE_SPIRA);
+                            updatedIncidents.AddRange(incidentBatch);
+                        }
+                        LogTraceEvent(eventLog, "Found " + updatedIncidents.Count + " updated incidents in " + productName, EventLogEntryType.Information);
+
+                        //Now we need to loop through these and update in JIRA
+                        foreach (SpiraSoapService.RemoteIncident remoteIncident in updatedIncidents)
+                        {
+                            try
+                            {
+                                ProcessUpdatedIncident(projectId, spiraImportExport, remoteIncident, newReleaseMappings, incidentCustomPropertyMappingList, incidentCustomPropertyValueMappingList, incidentCustomProperties, incidentMappings, jiraProject, jiraManager, productName, incidentSeverityMappings, incidentPriorityMappings, incidentStatusMappings, incidentTypeMappings, userMappings, releaseMappings, incidentComponentMappings, updatedJiraIds);
+                            }
+                            catch (Exception exception)
+                            {
+                                //Log and continue execution
+                                LogErrorEvent("Error Updating " + productName + " Incident to JIRA: " + exception.Message + "\n" + exception.StackTrace, EventLogEntryType.Error);
+                            }
+                        }
+
+                        //Finally we need to update the mapping data on the server
+                        //At this point we have potentially added releases only
+                        spiraImportExport.DataMapping_AddArtifactMappings(dataSyncSystemId, (int)Constants.ArtifactType.Release, newReleaseMappings.ToArray());
+                    }
                 }
 
                 //The following code is only needed during debugging

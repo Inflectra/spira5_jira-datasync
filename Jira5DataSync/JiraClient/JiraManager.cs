@@ -81,6 +81,37 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
         }
 
         /// <summary>
+        /// Returns the meta-data for all projects for which fields are available for creating a new issue (to avoid validation errors)
+        /// </summary>
+        /// <param name="issueKey">The id of the issue</param>
+        /// <param name="projectKey">Optionally filter by project</param>
+        /// <remarks>We log the meta-data with a Success Audit message if trace-logging is enabled</remarks>
+        public JiraEditMetaData GetEditMetaData(string issueKey, string projectKey = null)
+        {
+            string argument = issueKey + "/editmeta?expand=projects.issuetypes.fields";
+            if (!String.IsNullOrEmpty(projectKey))
+            {
+                argument += "&projectKeys=" + projectKey;
+            }
+            string json = RunQuery(JiraResource.issue, argument: argument, method: "GET");
+            LogTraceEvent(this.eventLog, json, EventLogEntryType.SuccessAudit);
+            return JsonConvert.DeserializeObject<JiraEditMetaData>(json);
+        }
+
+        /// <summary>
+        /// Returns the list of transitions that can be executed on the current incident
+        /// </summary>
+        /// <param name="issueKey">The id of the issue</param>
+        /// <remarks>We log the meta-data with a Success Audit message if trace-logging is enabled</remarks>
+        public JiraTransitionMetaData GetIssueTransitions(string issueKey)
+        {
+            string argument = issueKey + "/transitions";
+            string json = RunQuery(JiraResource.issue, argument: argument, method: "GET");
+            LogTraceEvent(this.eventLog, json, EventLogEntryType.SuccessAudit);
+            return JsonConvert.DeserializeObject<JiraTransitionMetaData>(json);
+        }
+
+        /// <summary>
         /// Gets the list of JIRA projects that the current user has access to
         /// </summary>
         /// <returns></returns>
@@ -132,6 +163,23 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
             string json = JsonConvert.SerializeObject(jWebLink);
             LogTraceEvent(this.eventLog, json, EventLogEntryType.Information);
             json = RunQuery(JiraResource.issue, issueKey + "/remotelink", json, "POST");
+        }
+
+        /// <summary>
+        /// Adds a comment to a JIRA issue
+        /// </summary>
+        /// <param name="issueKey">The key of the issue we're adding the link to(e.g. DEMO-1)</param>
+        /// <param name="body">The comment text</param>
+        /// <remarks>The comment is always added from the 'syncuser', JIRA does not allow setting of the author through the API</remarks>
+        public void AddComment(string issueKey, string body)
+        {
+            //Create the serialized object
+            JObject jComment = new JObject();
+            jComment["body"] = body;
+
+            string json = JsonConvert.SerializeObject(jComment);
+            LogTraceEvent(this.eventLog, json, EventLogEntryType.Information);
+            json = RunQuery(JiraResource.issue, issueKey + "/comment", json, "POST");
         }
 
         /// <summary>
@@ -220,6 +268,214 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Updates an existing JIRA issue in the system
+        /// </summary>
+        /// <param name="jiraIssue">The issue object</param>
+        /// <param name="statusChanged">Did the status change (need to execute a transition before updating)</param>
+        /// <param name="jiraEditMetaData">The editing meta-data</param>
+        public void SaveIssue(JiraIssue jiraIssue, bool statusChanged = false)
+        {
+            //Get the issue key/id
+            string issueKey = jiraIssue.Key.ToString();
+
+            //Get the edit meta data
+            JiraEditMetaData jiraEditMetaData = this.GetEditMetaData(issueKey);
+
+            //First convert from the JiraIssue to a generic json object
+            JObject jsonIssue = JObject.FromObject(jiraIssue);
+
+            JObject jsonIssueFields = (JObject)jsonIssue["fields"];
+            JObject jIssueTypeFields = null;
+
+            //Next validate the fields
+            List<string> messages = new List<string>();
+            //Find the current project and issue type in the meta-data
+            if (jiraEditMetaData != null && jsonIssueFields != null)
+            {
+                //See if we are missing any required properties (not custom fields at this point)
+                jIssueTypeFields = jiraEditMetaData.Fields;
+                foreach (KeyValuePair<string, JToken> field in jiraEditMetaData.Fields)
+                {
+                    string fieldName = field.Key;
+                    JToken fieldVaue = field.Value;
+                    bool required = fieldVaue["required"].Value<bool>();
+                    if (required && !fieldName.Contains(JiraCustomFieldValue.CUSTOM_FIELD_PREFIX) && !jsonIssueFields.Properties().Any(p => p.Name == fieldName))
+                    {
+                        messages.Add(String.Format("JIRA field '{0}' is required for project '{1}' and issue type {2} but was not provided.", fieldName, jiraIssue.Fields.Project.Key, jiraIssue.Fields.IssueType.Id));
+                    }
+                }
+
+                //Remove any properties that are not listed in the meta-data (never issue-type)
+                List<string> fieldsToRemove = new List<string>();
+                foreach (KeyValuePair<string, JToken> field in jsonIssueFields)
+                {
+                    string fieldName = field.Key;
+                    if (jiraEditMetaData.Fields[fieldName] == null && fieldName != "issuetype")
+                    {
+                        fieldsToRemove.Add(fieldName);  //Remove the property
+                    }
+                    
+                    //Always remove comment or attachment from updates (have to add using a separate API call)
+                    if (fieldName == "comment" || fieldName == "attachment")
+                    {
+                        fieldsToRemove.Add(fieldName);  //Remove the property
+                    }
+                }
+
+                //Now do the removes
+                foreach (string fieldToRemove in fieldsToRemove)
+                {
+                    jsonIssueFields.Remove(fieldToRemove);
+                }
+            }
+
+            //Throw an exception if we have any messages
+            if (messages.Count > 0)
+            {
+                throw new ApplicationException(String.Join(" \n", messages));
+            }
+
+            //Now we need to add the custom properties, which are not automatically serialized
+            foreach (JiraCustomFieldValue jiraCustomFieldValue in jiraIssue.CustomFieldValues)
+            {
+                if (jiraCustomFieldValue.Value != null)
+                {
+                    int id = jiraCustomFieldValue.CustomFieldId;
+                    string fieldName = jiraCustomFieldValue.CustomFieldName;
+
+                    //Make sure JIRA expects this field for this issue type
+                    if (jiraEditMetaData != null && jiraEditMetaData.Fields[fieldName] != null)
+                    {
+                        //Add to the issue json fields, handling the appropriate types correctly
+                        switch (jiraCustomFieldValue.Value.CustomPropertyType)
+                        {
+                            case CustomPropertyValue.CustomPropertyTypeEnum.Boolean:
+                                if (jiraCustomFieldValue.Value.BooleanValue.HasValue)
+                                {
+                                    jsonIssueFields.Add(fieldName, jiraCustomFieldValue.Value.BooleanValue.Value);
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.Date:
+                                if (jiraCustomFieldValue.Value.DateTimeValue.HasValue)
+                                {
+                                    jsonIssueFields.Add(fieldName, jiraCustomFieldValue.Value.DateTimeValue.Value);
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.Decimal:
+                                if (jiraCustomFieldValue.Value.DecimalValue.HasValue)
+                                {
+                                    jsonIssueFields.Add(fieldName, jiraCustomFieldValue.Value.DecimalValue.Value);
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.Integer:
+                                if (jiraCustomFieldValue.Value.IntegerValue.HasValue)
+                                {
+                                    jsonIssueFields.Add(fieldName, jiraCustomFieldValue.Value.IntegerValue.Value);
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.List:
+                                {
+                                    //JIRA expects an object with an 'id' property set
+                                    if (!String.IsNullOrEmpty(jiraCustomFieldValue.Value.StringValue))
+                                    {
+                                        //Need to lookup the id of the custom field option
+                                        int? customFieldOptionId = LookupCustomFieldOptionId(jiraCustomFieldValue.Value.StringValue, jIssueTypeFields, jiraCustomFieldValue.CustomFieldName);
+                                        if (customFieldOptionId.HasValue)
+                                        {
+                                            JObject jOption = new JObject();
+                                            jOption["id"] = customFieldOptionId.Value.ToString();
+                                            jsonIssueFields.Add(fieldName, jOption);
+                                        }
+                                    }
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.MultiList:
+                                {
+                                    //JIRA expects an array of objects with an 'id' property set
+                                    if (jiraCustomFieldValue.Value.MultiListValue.Count > 0)
+                                    {
+                                        JArray jOptions = new JArray();
+                                        foreach (string optionName in jiraCustomFieldValue.Value.MultiListValue)
+                                        {
+                                            //Need to lookup the id of the custom field option
+                                            int? customFieldOptionId = LookupCustomFieldOptionId(optionName, jIssueTypeFields, jiraCustomFieldValue.CustomFieldName);
+                                            if (customFieldOptionId.HasValue)
+                                            {
+                                                JObject jOption = new JObject();
+                                                jOption["id"] = customFieldOptionId.Value.ToString();
+                                                jOptions.Add(jOption);
+                                            }
+                                        }
+                                        jsonIssueFields.Add(fieldName, jOptions);
+                                    }
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.Text:
+                                {
+                                    if (!String.IsNullOrEmpty(jiraCustomFieldValue.Value.StringValue))
+                                    {
+                                        jsonIssueFields.Add(fieldName, jiraCustomFieldValue.Value.StringValue);
+                                    }
+                                }
+                                break;
+
+                            case CustomPropertyValue.CustomPropertyTypeEnum.User:
+                                {
+                                    //JIRA expects a user object with an 'name' property set
+                                    if (!String.IsNullOrEmpty(jiraCustomFieldValue.Value.StringValue))
+                                    {
+                                        JObject jUser = new JObject();
+                                        jUser["name"] = jiraCustomFieldValue.Value.StringValue;
+                                        jsonIssueFields.Add(fieldName, jUser);
+                                    }
+                                }
+                                break;
+                        }
+                    }
+                }
+            }
+
+            //If we have a transition, we need to do that first
+            if (statusChanged)
+            {
+                JiraTransitionMetaData transitionMetaData = this.GetIssueTransitions(issueKey);
+                if (transitionMetaData != null && transitionMetaData.Transitions != null)
+                {
+                    //See if we have a matching transition
+                    JiraTransition matchingTransition = transitionMetaData.Transitions.FirstOrDefault(t => t.To.IdString == jiraIssue.Fields.Status.IdString);
+                    if (matchingTransition != null)
+                    {
+                        //Fire the transition
+                        this.ExecuteTransition(issueKey, matchingTransition.IdString);
+                    }
+                }
+            }
+
+            //Send the PUT request to update the issue
+            string json = JsonConvert.SerializeObject(jsonIssue, Formatting.Indented, new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
+            LogTraceEvent(this.eventLog, json, EventLogEntryType.Information);
+            json = RunQuery(JiraResource.issue, issueKey, json, "PUT");
+        }
+
+        public void ExecuteTransition(string issueKey, string transitionId)
+        {
+            LogTraceEvent(this.eventLog, String.Format("Executing JIRA transition {0} on JIRA issue {1}", transitionId, issueKey), EventLogEntryType.Information);
+            //Send the POST request to execute the transition
+            JObject jTransition = new JObject();
+            jTransition["transition"] = new JObject();
+            jTransition["transition"]["id"] = transitionId;
+            string json = JsonConvert.SerializeObject(jTransition, Formatting.Indented, new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
+            LogTraceEvent(this.eventLog, json, EventLogEntryType.Information);
+            json = RunQuery(JiraResource.issue, issueKey + "/transitions", json, "POST");
         }
 
         /// <summary>

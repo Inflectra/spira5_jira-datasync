@@ -82,12 +82,16 @@
     <Compile Include="JiraClient\JiraComponent.cs" />
     <Compile Include="JiraClient\JiraCreateMetaData.cs" />
     <Compile Include="JiraClient\JiraCustomFieldValue.cs" />
+    <Compile Include="JiraClient\JiraEditMetaData.cs" />
     <Compile Include="JiraClient\JiraIssue.cs" />
     <Compile Include="JiraClient\JiraIssueLink.cs" />
     <Compile Include="JiraClient\JiraManager.cs" />
     <Compile Include="JiraClient\JiraProject.cs" />
     <Compile Include="JiraClient\JiraSearchRequest.cs" />
     <Compile Include="JiraClient\JiraSearchResponse.cs" />
+    <Compile Include="JiraClient\JiraTransition.cs" />
+    <Compile Include="JiraClient\JiraTransitionMetaData.cs" />
+    <Compile Include="JiraClient\JiraTransitionTo.cs" />
     <Compile Include="JiraClient\JiraVersion.cs" />
     <Compile Include="PermissiveSecurityPolicy.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
