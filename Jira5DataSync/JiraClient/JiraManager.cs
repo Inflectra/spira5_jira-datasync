@@ -452,11 +452,19 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
                 {
                     //See if we have a matching transition
                     JiraTransition matchingTransition = transitionMetaData.Transitions.FirstOrDefault(t => t.To.IdString == jiraIssue.Fields.Status.IdString);
-                    if (matchingTransition != null)
+                    if (matchingTransition == null)
+                    {
+                        LogErrorEvent(String.Format("Unable to find matching Jira transition for status '{0}'", jiraIssue.Fields.Status.IdString), EventLogEntryType.Warning);
+                    }
+                    else
                     {
                         //Fire the transition
                         this.ExecuteTransition(issueKey, matchingTransition.IdString);
                     }
+                }
+                else
+                {
+                    LogErrorEvent(String.Format("Unable to get Jira workflow transitions for issue '{0}'", issueKey), EventLogEntryType.Warning);
                 }
             }
 

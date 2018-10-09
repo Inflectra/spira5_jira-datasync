@@ -2974,13 +2974,25 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     }
 
                     //Now populate all the custom property values onto the Jira issue object
+                    //Unlike the INSERT case, we have to make sure they don't already exist on the object
                     if (customPropertyValues.Count > 0)
                     {
                         foreach (KeyValuePair<int, CustomPropertyValue> customPropertyValue in customPropertyValues)
                         {
-                            JiraCustomFieldValue customFieldValue = new JiraCustomFieldValue(customPropertyValue.Key);
-                            customFieldValue.Value = customPropertyValue.Value;
-                            jiraIssue.CustomFieldValues.Add(customFieldValue);
+                            int customFieldId = customPropertyValue.Key;    //The Jira customfield_xxxxxx
+                            JiraCustomFieldValue matchingField = jiraIssue.CustomFieldValues.FirstOrDefault(c => c.CustomFieldId == customFieldId);
+                            if (matchingField == null)
+                            {
+                                //Add new custom field to Jira issue
+                                JiraCustomFieldValue customFieldValue = new JiraCustomFieldValue(customFieldId);
+                                customFieldValue.Value = customPropertyValue.Value;
+                                jiraIssue.CustomFieldValues.Add(customFieldValue);
+                            }
+                            else
+                            {
+                                //Already exists, so just update
+                                matchingField.Value = customPropertyValue.Value;
+                            }
                         }
                         LogTraceEvent(eventLog, "Set custom values onto JIRA issue object\n", EventLogEntryType.Information);
                     }
