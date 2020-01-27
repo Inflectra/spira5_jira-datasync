@@ -26,6 +26,10 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
         public const int REQUIREMENT_STATUS_DEFAULT = 1; /* Requested */
         public const int REQUIREMENT_TYPE_DEFAULT = 4;  /* User Story */
 
+        //Comment identifiers
+        public const string COMMENT_IDENTIFIER_FROM_SPIRA = "[SpiraDataSync]";
+        public const string COMMENT_IDENTIFIER_FROM_JIRA = "[JiraDataSync]";
+
         #region Enumerations
 
         /// <summary>

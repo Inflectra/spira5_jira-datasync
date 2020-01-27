@@ -459,7 +459,12 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
                     else
                     {
                         //Fire the transition
-                        this.ExecuteTransition(issueKey, matchingTransition.IdString);
+                        int? resolutionId = null;
+                        if (jiraIssue.Fields.Resolution != null && jiraIssue.Fields.Resolution.Id.HasValue)
+                        {
+                            resolutionId = jiraIssue.Fields.Resolution.Id.Value;
+                        }
+                        this.ExecuteTransition(issueKey, matchingTransition.IdString, resolutionId);
                     }
                 }
                 else
@@ -474,13 +479,23 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
             json = RunQuery(JiraResource.issue, issueKey, json, "PUT");
         }
 
-        public void ExecuteTransition(string issueKey, string transitionId)
+        /// <summary>
+        /// Executes a Jira issue transition
+        /// </summary>
+        /// <param name="issueKey">The id of the issue</param>
+        /// <param name="transitionId">The id of the transition to execute</param>
+        /// <param name="resolution">The id of a resolution to specify (optional)</param>
+        public void ExecuteTransition(string issueKey, string transitionId, int? resolutionId = null)
         {
             LogTraceEvent(this.eventLog, String.Format("Executing JIRA transition {0} on JIRA issue {1}", transitionId, issueKey), EventLogEntryType.Information);
             //Send the POST request to execute the transition
             JObject jTransition = new JObject();
             jTransition["transition"] = new JObject();
             jTransition["transition"]["id"] = transitionId;
+            if (resolutionId != null)
+            {
+                jTransition["transition"]["resolution"]["id"] = resolutionId;
+            }
             string json = JsonConvert.SerializeObject(jTransition, Formatting.Indented, new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
             LogTraceEvent(this.eventLog, json, EventLogEntryType.Information);
             json = RunQuery(JiraResource.issue, issueKey + "/transitions", json, "POST");
@@ -792,161 +807,169 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient
         /// <returns>The JIRA issue object</returns>
         public JiraIssue GetIssueByKey(string issueKey, JiraCreateMetaData jiraCreateMetaData)
         {
-            string result = RunQuery(resource: JiraResource.issue, argument: issueKey, method: "GET");
-            LogTraceEvent(this.eventLog, result, EventLogEntryType.SuccessAudit);
-
-            //First deserialize into a generic JObject;
-            JObject jIssue = JObject.Parse(result);
-
-            //For the standard fields we use the standard deserializer
-            JiraIssue issue = jIssue.ToObject<JiraIssue>();
-
-            //We need to get a handle on the fields meta-data for use later
-            JObject jIssueTypeFields = null;
-            if (jiraCreateMetaData != null)
+            try
             {
-                JiraProject project = jiraCreateMetaData.Projects.FirstOrDefault(p => p.Id == issue.Fields.Project.Id);
-                if (project != null)
+                string result = RunQuery(resource: JiraResource.issue, argument: issueKey, method: "GET");
+                LogTraceEvent(this.eventLog, result, EventLogEntryType.SuccessAudit);
+
+                //First deserialize into a generic JObject;
+                JObject jIssue = JObject.Parse(result);
+
+                //For the standard fields we use the standard deserializer
+                JiraIssue issue = jIssue.ToObject<JiraIssue>();
+
+                //We need to get a handle on the fields meta-data for use later
+                JObject jIssueTypeFields = null;
+                if (jiraCreateMetaData != null)
                 {
-                    IssueType issueType = project.IssueTypes.FirstOrDefault(t => t.Id == issue.Fields.IssueType.Id);
-                    if (issueType != null)
+                    JiraProject project = jiraCreateMetaData.Projects.FirstOrDefault(p => p.Id == issue.Fields.Project.Id);
+                    if (project != null)
                     {
-                        //See if we are missing any required properties
-                        jIssueTypeFields = issueType.Fields;
+                        IssueType issueType = project.IssueTypes.FirstOrDefault(t => t.Id == issue.Fields.IssueType.Id);
+                        if (issueType != null)
+                        {
+                            //See if we are missing any required properties
+                            jIssueTypeFields = issueType.Fields;
+                        }
                     }
                 }
-            }
 
 
-            //Now we need to get the custom fields from the JObject directly
-            JObject jFields = (JObject)jIssue["fields"];
-            if (jFields != null)
-            {
-                foreach (JProperty jProperty in jFields.Properties())
+                //Now we need to get the custom fields from the JObject directly
+                JObject jFields = (JObject)jIssue["fields"];
+                if (jFields != null)
                 {
-                    //Make sure it's a custom field
-                    if (jProperty.Name.StartsWith(JiraCustomFieldValue.CUSTOM_FIELD_PREFIX))
+                    foreach (JProperty jProperty in jFields.Properties())
                     {
-                        JiraCustomFieldValue customFieldValue = new JiraCustomFieldValue(jProperty.Name);
-                        CustomPropertyValue cpv = new CustomPropertyValue();
-
-                        //We need to try and match the type of value
-                        if (jProperty.Value != null && jProperty.Value.Type != JTokenType.None && jProperty.Value.Type != JTokenType.Null)
+                        //Make sure it's a custom field
+                        if (jProperty.Name.StartsWith(JiraCustomFieldValue.CUSTOM_FIELD_PREFIX))
                         {
-                            LogTraceEvent(eventLog, String.Format("Found custom field '{0}' of JProperty type " + jProperty.Value.Type, jProperty.Name), EventLogEntryType.Information);
-                            if (jProperty.Value.Type == JTokenType.Array && jProperty.Value is JArray)
-                            {
-                                //Iterate through the list of values
-                                List<string> listOptionValueNames = new List<string>();
+                            JiraCustomFieldValue customFieldValue = new JiraCustomFieldValue(jProperty.Name);
+                            CustomPropertyValue cpv = new CustomPropertyValue();
 
-                                JArray jOptions = (JArray)jProperty.Value;
-                                foreach (JToken jToken in jOptions)
+                            //We need to try and match the type of value
+                            if (jProperty.Value != null && jProperty.Value.Type != JTokenType.None && jProperty.Value.Type != JTokenType.Null)
+                            {
+                                LogTraceEvent(eventLog, String.Format("Found custom field '{0}' of JProperty type " + jProperty.Value.Type, jProperty.Name), EventLogEntryType.Information);
+                                if (jProperty.Value.Type == JTokenType.Array && jProperty.Value is JArray)
                                 {
-                                    if (jToken is JObject)
+                                    //Iterate through the list of values
+                                    List<string> listOptionValueNames = new List<string>();
+
+                                    JArray jOptions = (JArray)jProperty.Value;
+                                    foreach (JToken jToken in jOptions)
                                     {
-                                        JObject jOption = (JObject)jToken;
-                                        //If we have an object that has an ID property then we have a multi-list
+                                        if (jToken is JObject)
+                                        {
+                                            JObject jOption = (JObject)jToken;
+                                            //If we have an object that has an ID property then we have a multi-list
+                                            if (jOption["id"] != null && jOption["id"].Type == JTokenType.String)
+                                            {
+                                                LogTraceEvent(eventLog, String.Format("Found custom field '{0}' that is an array of objects with ID field ({1})", jProperty.Name, jOption["id"].Type), EventLogEntryType.Information);
+                                                string id = (string)jOption["id"];
+                                                if (!String.IsNullOrEmpty(id))
+                                                {
+                                                    //Need to convert into an integer and set the list value
+                                                    int idAsInt;
+                                                    if (Int32.TryParse(id, out idAsInt))
+                                                    {
+                                                        LogTraceEvent(eventLog, String.Format("Looking for custom field value name that matches custom field {0} option value id {1}", jProperty.Name, idAsInt), EventLogEntryType.Information);
+                                                        string optionName = LookupCustomFieldOptionName(idAsInt, jIssueTypeFields, customFieldValue.CustomFieldName);
+                                                        listOptionValueNames.Add(optionName);
+                                                        LogTraceEvent(eventLog, String.Format("Found JIRA custom field {2} value name that matches custom field {0} option value id {1}", jProperty.Name, idAsInt, optionName), EventLogEntryType.Information);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (listOptionValueNames.Count > 0)
+                                    {
+                                        cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.MultiList;
+                                        cpv.MultiListValue = listOptionValueNames;
+                                    }
+                                }
+                                else if (jProperty.Value.Type == JTokenType.Object)
+                                {
+                                    //If we have an object that has an ID property then we have a single-list
+                                    //If we have a 'name' property then we have a user field
+                                    if (jProperty.Value is JObject)
+                                    {
+                                        JObject jOption = (JObject)jProperty.Value;
                                         if (jOption["id"] != null && jOption["id"].Type == JTokenType.String)
                                         {
-                                            LogTraceEvent(eventLog, String.Format("Found custom field '{0}' that is an array of objects with ID field ({1})", jProperty.Name, jOption["id"].Type), EventLogEntryType.Information);
+                                            LogTraceEvent(eventLog, String.Format("Found custom field '{0}' that is an object with ID field ({1})", jProperty.Name, jOption["id"].Type), EventLogEntryType.Information);
                                             string id = (string)jOption["id"];
                                             if (!String.IsNullOrEmpty(id))
                                             {
-                                                //Need to convert into an integer and set the list value
+                                                //Need to convert into an integer and get the name from the meta-data
                                                 int idAsInt;
                                                 if (Int32.TryParse(id, out idAsInt))
                                                 {
                                                     LogTraceEvent(eventLog, String.Format("Looking for custom field value name that matches custom field {0} option value id {1}", jProperty.Name, idAsInt), EventLogEntryType.Information);
                                                     string optionName = LookupCustomFieldOptionName(idAsInt, jIssueTypeFields, customFieldValue.CustomFieldName);
-                                                    listOptionValueNames.Add(optionName);
+                                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.List;
+                                                    cpv.StringValue = optionName;
                                                     LogTraceEvent(eventLog, String.Format("Found JIRA custom field {2} value name that matches custom field {0} option value id {1}", jProperty.Name, idAsInt, optionName), EventLogEntryType.Information);
                                                 }
                                             }
                                         }
-                                    }
-                                }
-
-                                if (listOptionValueNames.Count > 0)
-                                {
-                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.MultiList;
-                                    cpv.MultiListValue = listOptionValueNames;
-                                }
-                            }
-                            else if (jProperty.Value.Type == JTokenType.Object)
-                            {
-                                //If we have an object that has an ID property then we have a single-list
-                                //If we have a 'name' property then we have a user field
-                                if (jProperty.Value is JObject)
-                                {
-                                    JObject jOption = (JObject)jProperty.Value;
-                                    if (jOption["id"] != null && jOption["id"].Type == JTokenType.String)
-                                    {
-                                        LogTraceEvent(eventLog, String.Format("Found custom field '{0}' that is an object with ID field ({1})", jProperty.Name, jOption["id"].Type), EventLogEntryType.Information);
-                                        string id = (string)jOption["id"];
-                                        if (!String.IsNullOrEmpty(id))
+                                        else if (jOption["name"] != null && jOption["name"].Type == JTokenType.String)
                                         {
-                                            //Need to convert into an integer and get the name from the meta-data
-                                            int idAsInt;
-                                            if (Int32.TryParse(id, out idAsInt))
+                                            LogTraceEvent(eventLog, String.Format("Found custom field '{0}' that is an object with NAME field ({1})", jProperty.Name, jOption["name"].Type), EventLogEntryType.Information);
+                                            string username = (string)jOption["name"];
+                                            if (!String.IsNullOrEmpty(username))
                                             {
-                                                LogTraceEvent(eventLog, String.Format("Looking for custom field value name that matches custom field {0} option value id {1}", jProperty.Name, idAsInt), EventLogEntryType.Information);
-                                                string optionName = LookupCustomFieldOptionName(idAsInt, jIssueTypeFields, customFieldValue.CustomFieldName);
-                                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.List;
-                                                cpv.StringValue = optionName;
-                                                LogTraceEvent(eventLog, String.Format("Found JIRA custom field {2} value name that matches custom field {0} option value id {1}", jProperty.Name, idAsInt, optionName), EventLogEntryType.Information);
+                                                cpv.StringValue = username;
+                                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.User;
                                             }
                                         }
                                     }
-                                    else if (jOption["name"] != null && jOption["name"].Type == JTokenType.String)
-                                    {
-                                        LogTraceEvent(eventLog, String.Format("Found custom field '{0}' that is an object with NAME field ({1})", jProperty.Name, jOption["name"].Type), EventLogEntryType.Information);
-                                        string username = (string)jOption["name"];
-                                        if (!String.IsNullOrEmpty(username))
-                                        {
-                                            cpv.StringValue = username;
-                                            cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.User;
-                                        }
-                                    }
+                                }
+                                else if (jProperty.Value.Type == JTokenType.Boolean)
+                                {
+                                    //Simple integer property
+                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Boolean;
+                                    cpv.BooleanValue = (bool?)jProperty.Value;
+                                }
+                                else if (jProperty.Value.Type == JTokenType.Integer)
+                                {
+                                    //Simple integer property
+                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Integer;
+                                    cpv.IntegerValue = (int?)jProperty.Value;
+                                }
+                                else if (jProperty.Value.Type == JTokenType.Float)
+                                {
+                                    //Simple float property
+                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Decimal;
+                                    cpv.DecimalValue = (decimal?)((float?)jProperty.Value);
+                                }
+                                else if (jProperty.Value.Type == JTokenType.Date)
+                                {
+                                    //Simple date/time property
+                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Date;
+                                    cpv.DateTimeValue = (DateTime?)jProperty.Value;
+                                }
+                                else if (jProperty.Value.Type == JTokenType.String)
+                                {
+                                    //Simple string property
+                                    cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Text;
+                                    cpv.StringValue = (string)jProperty.Value;
                                 }
                             }
-                            else if (jProperty.Value.Type == JTokenType.Boolean)
-                            {
-                                //Simple integer property
-                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Boolean;
-                                cpv.BooleanValue = (bool?)jProperty.Value;
-                            }
-                            else if (jProperty.Value.Type == JTokenType.Integer)
-                            {
-                                //Simple integer property
-                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Integer;
-                                cpv.IntegerValue = (int?)jProperty.Value;
-                            }
-                            else if (jProperty.Value.Type == JTokenType.Float)
-                            {
-                                //Simple float property
-                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Decimal;
-                                cpv.DecimalValue = (decimal?)((float?)jProperty.Value);
-                            }
-                            else if (jProperty.Value.Type == JTokenType.Date)
-                            {
-                                //Simple date/time property
-                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Date;
-                                cpv.DateTimeValue = (DateTime?)jProperty.Value;
-                            }
-                            else if (jProperty.Value.Type == JTokenType.String)
-                            {
-                                //Simple string property
-                                cpv.CustomPropertyType = CustomPropertyValue.CustomPropertyTypeEnum.Text;
-                                cpv.StringValue = (string)jProperty.Value;
-                            }
+                            customFieldValue.Value = cpv;
+                            issue.CustomFieldValues.Add(customFieldValue);
                         }
-                        customFieldValue.Value = cpv;
-                        issue.CustomFieldValues.Add(customFieldValue);
                     }
                 }
-            }
 
-            return issue;
+                return issue;
+            }
+            catch (Exception exception)
+            {
+                //Throw a better exception that has the Jira issue ID in it
+                throw new ApplicationException(String.Format("Unable to retrieve Jira issue {0} due to error message from Jira '{1}'", issueKey, exception.Message));
+            }
         }
 
         /// <summary>

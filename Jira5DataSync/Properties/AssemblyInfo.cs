@@ -6,12 +6,12 @@ using System.Runtime.CompilerServices;
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
 //
-[assembly: AssemblyTitle("Jira 5.x Data-Synchronization Plug-In")]
-[assembly: AssemblyDescription("Used to synchronize data between instances of SpiraTest 5.1+ and JIRA 5.0+")]
+[assembly: AssemblyTitle("Jira Server Data-Synchronization Plug-In")]
+[assembly: AssemblyDescription("Used to synchronize data between instances of Spira and Jira Server 5.x and later")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("Inflectra Corporation")]
 [assembly: AssemblyProduct("SpiraTest")]
-[assembly: AssemblyCopyright("Copyright (C) 2006-2017 Inflectra Corporation")]
+[assembly: AssemblyCopyright("Copyright (C) 2006-2019 Inflectra Corporation")]
 [assembly: AssemblyTrademark("Inflectra and SpiraTest are either registered trademarks or trademarks of Inflectra Corporation in the U.S. and/or other countries.")]
 [assembly: AssemblyCulture("")]
 
@@ -26,7 +26,7 @@ using System.Runtime.CompilerServices;
 // You can specify all the values or you can default the Revision and Build Numbers 
 // by using the '*' as shown below:
 
-[assembly: AssemblyVersion("5.1.0.*")]
+[assembly: AssemblyVersion("5.1.2.*")]
 
 //
 // In order to sign your assembly you must specify a key to use. Refer to the 

@@ -21,7 +21,7 @@ using Inflectra.SpiraTest.PlugIns.Jira5DataSync.JiraClient;
 namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
 {
     /// <summary>
-    /// Contains all the logic necessary to sync SpiraTest 4.x with Jira 5.x
+    /// Contains all the logic necessary to sync SpiraTest 4.x with Jira Server 5.x
     /// </summary>
     public class DataSync : IDataSyncPlugIn
     {
@@ -709,14 +709,24 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     {
                         foreach(JiraComment jiraComment in jiraComments)
                         {
-                            //Add the author, date and body to the resolution
-                            //See if we already have this resolution inside SpiraTest
+                            //Add the author, date and body to the comment
+                            //See if we already have this comment inside SpiraTest
+                            //We check to see if it has the token or there is a match on existing
+                            string jiraCommentText = (jiraComment.Body == null) ? "" : jiraComment.Body.Trim();
                             bool alreadyAdded = false;
-                            if (incidentComments != null)
+                            if (jiraCommentText.Contains(Constants.COMMENT_IDENTIFIER_FROM_SPIRA))
+                            {
+                                //It previously came from Spira so don't add back to Spira
+                                alreadyAdded = true;
+                            }
+                            if (!alreadyAdded && incidentComments != null)
                             {
                                 foreach (SpiraSoapService.RemoteComment incidentComment in incidentComments)
                                 {
-                                    if (InternalFunctions.HtmlRenderAsPlainText(incidentComment.Text).Trim() == jiraComment.Body.Trim())
+                                    if (InternalFunctions.HtmlRenderAsPlainText(incidentComment.Text).Trim() == jiraCommentText ||
+                                        InternalFunctions.HtmlRenderAsPlainText(incidentComment.Text).Trim() == Constants.COMMENT_IDENTIFIER_FROM_JIRA + " " + jiraCommentText ||
+                                        InternalFunctions.HtmlRenderAsPlainText(incidentComment.Text).Trim() == InternalFunctions.HtmlRenderAsPlainText(jiraCommentText) ||
+                                        InternalFunctions.HtmlRenderAsPlainText(incidentComment.Text).Trim() == Constants.COMMENT_IDENTIFIER_FROM_JIRA + " " + InternalFunctions.HtmlRenderAsPlainText(jiraCommentText))
                                     {
                                         alreadyAdded = true;
                                     }
@@ -759,7 +769,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                                 newIncidentComment.ArtifactId = incidentId;
                                 newIncidentComment.UserId = creatorId;
                                 newIncidentComment.CreationDate = createdDate;
-                                newIncidentComment.Text = jiraComment.Body;
+                                newIncidentComment.Text = Constants.COMMENT_IDENTIFIER_FROM_JIRA + " " + jiraCommentText;
                                 newIncidentComments.Add(newIncidentComment);
                             }
                         }
@@ -2180,7 +2190,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     {
                         foreach (RemoteComment remoteComment in remoteComments)
                         {
-                            string body = InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text);
+                            string body = Constants.COMMENT_IDENTIFIER_FROM_SPIRA + " " + InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text);
                             jiraManager.AddComment(jiraIssueLink.Key.ToString(), body);
                         }
                     }
@@ -3006,11 +3016,20 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                         {
                             foreach (RemoteComment remoteComment in remoteComments)
                             {
-                                bool alreadyAdded = jiraIssue.Fields.Comment.Comments.Any(c => c.Body.Trim() == (InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text).Trim()));
+                                string spiraCommentText = InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text).Trim();
+                                bool alreadyAdded = false;
+                                if (spiraCommentText.Contains(Constants.COMMENT_IDENTIFIER_FROM_JIRA))
+                                {
+                                    alreadyAdded = true;
+                                }
+                                if (!alreadyAdded)
+                                {
+                                    alreadyAdded = jiraIssue.Fields.Comment.Comments.Any(c => c.Body.Trim() == spiraCommentText || c.Body.Trim() == (Constants.COMMENT_IDENTIFIER_FROM_SPIRA + " " + spiraCommentText).Trim());
+                                }
 
                                 if (!alreadyAdded)
                                 {
-                                    string body = InternalFunctions.HtmlRenderAsPlainText(remoteComment.Text);
+                                    string body = Constants.COMMENT_IDENTIFIER_FROM_SPIRA + " " + spiraCommentText;
                                     jiraManager.AddComment(jiraIssue.Key.ToString(), body);
                                 }
                             }
@@ -3096,7 +3115,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                 List<JiraProject> jiraProjects = jiraManager.GetProjects();
 
                 //Get the create incident meta-data for all projects (so that we can verify which fields we need to provide)
-                this.jiraCreateMetaData = jiraManager.GetCreateMetaData();
+                //this.jiraCreateMetaData = jiraManager.GetCreateMetaData();
 
                 //Loop for each of the projects in the project mapping
                 foreach (SpiraSoapService.RemoteDataMapping projectMapping in projectMappings)
@@ -3108,7 +3127,7 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                     //The following line was recommended as being slightly better in terms of not getting errors
                     //when JIRA is misconfigured in other projects, but we need to test it thoroughly first
                     //Get the create incident meta-data for the specific (so that we can verify which fields we need to provide)
-                    //this.jiraCreateMetaData = jiraManager.GetCreateMetaData(jiraProjectKey);
+                    this.jiraCreateMetaData = jiraManager.GetCreateMetaData(jiraProjectKey);
 
                     //Re-authenticate with Spira to avoid potential timeout issues
                     success = spiraImportExport.Connection_Authenticate2(internalLogin, internalPassword, DATA_SYNC_NAME);
@@ -3284,9 +3303,16 @@ namespace Inflectra.SpiraTest.PlugIns.Jira5DataSync
                         List<JiraIssue> jiraIssueKeys = jiraManager.GetIssues(jqlFilter, jiraKeyFields, startIndex, Constants.INCIDENT_PAGE_SIZE_JIRA);
                         foreach (JiraIssue jiraIssueKey in jiraIssueKeys)
                         {
-                            //Now get the full record, including non-navigable fields and comments
-                            JiraIssue jiraIssue = jiraManager.GetIssueByKey(jiraIssueKey.Key.ToString(), this.jiraCreateMetaData);
-                            jiraIssues.Add(jiraIssue);
+                            try
+                            {
+                                //Now get the full record, including non-navigable fields and comments
+                                JiraIssue jiraIssue = jiraManager.GetIssueByKey(jiraIssueKey.Key.ToString(), this.jiraCreateMetaData);
+                                jiraIssues.Add(jiraIssue);
+                            }
+                            catch (Exception exception)
+                            {
+                                LogErrorEvent("Unable to retrieve JIRA issue " + jiraIssueKey.Key + " - " + exception.Message);
+                            }
                         }
                         if (jiraIssueKeys.Count < Constants.INCIDENT_PAGE_SIZE_JIRA)
                         {
